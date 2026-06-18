@@ -26,19 +26,24 @@ Packet packet;
 uint8_t currentQuestion = 0;
 bool quizInProgress = false;
 
+// Сохраняем текст вопроса и варианты для повторной отправки
+String savedQuestion = "";
+String savedAnswers[4];
+
 // Массив для отслеживания подтверждений от каждого пульта
 bool ackReceived[9] = {false, false, false, false, false, false, false, false, false};
 unsigned long quizSendTime = 0;
-const unsigned long ACK_TIMEOUT = 1500; // 1.5 секунды на подтверждение
+const unsigned long ACK_TIMEOUT = 2000; // 2 секунды на подтверждение
+const unsigned long RESEND_DELAY = 500; // Задержка перед повторной отправкой
 
 void switchToTx() {
   radio.stopListening();
-  delay(10);
+  delay(5);
 }
 
 void switchToRx() {
   radio.startListening();
-  delay(10);
+  delay(5);
 }
 
 void sendChunk(byte type, byte targetId, byte part, bool last, const char* data) {
@@ -52,11 +57,14 @@ void sendChunk(byte type, byte targetId, byte part, bool last, const char* data)
   strncpy(packet.text, data, 29);
 
   switchToTx();
-  radio.write(&packet, sizeof(packet));
-  delay(10);
+  // Отправляем несколько раз для надёжности
+  for (int i = 0; i < 3; i++) {
+    radio.write(&packet, sizeof(packet));
+    delay(3);
+  }
   switchToRx();
 
-  delay(15);
+  delay(8);
 }
 
 void sendText(byte type, byte targetId, String txt) {
@@ -72,24 +80,31 @@ void sendText(byte type, byte targetId, String txt) {
     sendChunk(type, targetId, part, last, chunk);
 
     part++;
-    delay(20);
+    delay(10);
   }
 }
 
 void sendQuiz(uint8_t qNum, String q, String a1, String a2, String a3, String a4) {
   currentQuestion = qNum;
   
-  Serial.println("\n--- SENDING QUIZ ---");
+  // Сохраняем текст для повторной отправки
+  savedQuestion = q;
+  savedAnswers[0] = a1;
+  savedAnswers[1] = a2;
+  savedAnswers[2] = a3;
+  savedAnswers[3] = a4;
   
-  // Отправляем всем пультам
+  Serial.println("\n--- SENDING QUIZ TO ALL ---");
+  
+  // Отправляем всем пультам (targetId = 0)
   sendText(1, 0, q);
-  delay(200);
+  delay(100);
   sendText(2, 0, a1);
-  delay(200);
+  delay(100);
   sendText(2, 0, a2);
-  delay(200);
+  delay(100);
   sendText(2, 0, a3);
-  delay(200);
+  delay(100);
   sendText(2, 0, a4);
 
   // Инициализируем массив подтверждений
@@ -106,31 +121,29 @@ void sendQuiz(uint8_t qNum, String q, String a1, String a2, String a3, String a4
   Serial.println("WAITING FOR ACK FROM ALL PULTS...");
 }
 
-void sendQuizToSpecific(uint8_t pultId, uint8_t qNum, String q, String a1, String a2, String a3, String a4) {
-  currentQuestion = qNum;
-  
-  Serial.print("\n--- RESENDING QUIZ TO PULT ");
-  Serial.print(pultId);
-  Serial.println(" ---");
-  
-  // Отправляем только конкретному пульту
-  sendText(6, pultId, q); // type 6 = повторный вопрос
-  delay(200);
-  sendText(2, pultId, a1);
-  delay(200);
-  sendText(2, pultId, a2);
-  delay(200);
-  sendText(2, pultId, a3);
-  delay(200);
-  sendText(2, pultId, a4);
-
-  ackReceived[pultId] = false;
-  quizSendTime = millis();
-
-  Serial.print("REPEAT QUIZ #");
-  Serial.print(qNum);
-  Serial.print(" SENT TO PULT ");
-  Serial.println(pultId);
+void resendQuizToMissing() {
+  // Находим пульты, которые не подтвердили
+  for (int i = 1; i <= 8; i++) {
+    if (!ackReceived[i]) {
+      Serial.print("RESENDING to PULT ");
+      Serial.print(i);
+      Serial.print("... ");
+      
+      // Отправляем этому пульту конкретно (targetId = i)
+      sendText(1, i, savedQuestion);
+      delay(80);
+      sendText(2, i, savedAnswers[0]);
+      delay(80);
+      sendText(2, i, savedAnswers[1]);
+      delay(80);
+      sendText(2, i, savedAnswers[2]);
+      delay(80);
+      sendText(2, i, savedAnswers[3]);
+      
+      Serial.println("done");
+      delay(100);
+    }
+  }
 }
 
 void sendEnd() {
@@ -145,9 +158,9 @@ void sendEnd() {
   memset(endp.text, 0, sizeof(endp.text));
 
   switchToTx();
-  for (int i = 0; i < 5; i++) {
+  for (int i = 0; i < 8; i++) {
     radio.write(&endp, sizeof(endp));
-    delay(15);
+    delay(5);
   }
   switchToRx();
 
@@ -166,9 +179,9 @@ void sendAck(byte pultId) {
   memset(ack.text, 0, sizeof(ack.text));
 
   switchToTx();
-  for (int i = 0; i < 2; i++) {
+  for (int i = 0; i < 3; i++) {
     radio.write(&ack, sizeof(ack));
-    delay(5);
+    delay(3);
   }
   switchToRx();
 }
@@ -204,35 +217,62 @@ void checkAnswers() {
 
 void waitForAllAck() {
   unsigned long startTime = millis();
+  int attemptCount = 0;
+  const int MAX_ATTEMPTS = 3;
   
-  Serial.print("Waiting for ACK... ");
-  
-  while (millis() - startTime < ACK_TIMEOUT) {
-    checkAnswers();
-    delay(30);
+  while (attemptCount < MAX_ATTEMPTS) {
+    // Первый цикл ожидания
+    Serial.print("Attempt ");
+    Serial.print(attemptCount + 1);
+    Serial.print("/");
+    Serial.print(MAX_ATTEMPTS);
+    Serial.print(" - Waiting for ACK... ");
+    
+    startTime = millis();
+    while (millis() - startTime < ACK_TIMEOUT) {
+      checkAnswers();
+      delay(30);
 
-    // Проверяем, получены ли подтверждения от всех пультов
-    bool allAcked = true;
-    for (int i = 1; i <= 8; i++) {
-      if (!ackReceived[i]) {
-        allAcked = false;
-        break;
+      // Проверяем, получены ли подтверждения от всех пультов
+      bool allAcked = true;
+      for (int i = 1; i <= 8; i++) {
+        if (!ackReceived[i]) {
+          allAcked = false;
+          break;
+        }
+      }
+
+      if (allAcked) {
+        Serial.println("ALL PULTS CONFIRMED!");
+        delay(300);
+        return;
       }
     }
 
-    if (allAcked) {
-      Serial.println("ALL PULTS CONFIRMED!");
-      delay(500);
-      return;
+    // Время истекло
+    Serial.println("TIMEOUT!");
+    Serial.println("Missing ACK from:");
+    for (int i = 1; i <= 8; i++) {
+      if (!ackReceived[i]) {
+        Serial.print("  PULT ");
+        Serial.println(i);
+      }
+    }
+
+    // Если это не последняя попытка - пересылаем
+    attemptCount++;
+    if (attemptCount < MAX_ATTEMPTS) {
+      delay(RESEND_DELAY);
+      Serial.println("Resending quiz...");
+      resendQuizToMissing();
+      delay(RESEND_DELAY);
     }
   }
 
-  // Таймаут истёк - проверяем кто не ответил
-  Serial.println("TIMEOUT!");
-  Serial.println("Missing ACK from:");
+  Serial.println("\nFINAL RESULT - Missing ACK from:");
   for (int i = 1; i <= 8; i++) {
     if (!ackReceived[i]) {
-      Serial.print("PULT ");
+      Serial.print("  PULT ");
       Serial.println(i);
     }
   }
